@@ -1,0 +1,13 @@
+__pycache__
+*.pyc
+
+*.html
+
+.vscode
+
+corpora
+/data
+/results
+backup
+
+*.out

@@ -1,0 +1,249 @@
+---
+title: "Gender bias and frequency"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, message=F, warning=F}
+library(tidyverse)
+library(gg.layers)
+library(scales)
+library(glue)
+library(latex2exp)
+library(kableExtra)
+library(cowplot)
+```
+
+
+```{r}
+A = "FEMALE"
+B = "MALE"
+PMI_SMOOTHING=0.01
+```
+
+```{r}
+pmi_name = glue("pmi{PMI_SMOOTHING*100}")
+```
+
+## Data
+
+```{r}
+files_bias = list()
+files_bias[["glove"]] = list.files(
+  "results", pattern=glue("bias_glove-.+-{A}-{B}\\.csv"), full.names=T)
+files_bias[["sgns"]] = list.files(
+  "results", pattern=glue("bias_sgns-.+-{A}-{B}\\.csv"), full.names=T)
+files_bias[[pmi_name]] = list.files(
+  "results", pattern=glue("bias_pmi-.+-{A}-{B}-s{PMI_SMOOTHING}\\.csv"),
+  full.names=T)
+```
+
+
+```{r}
+for (n in names(files_bias)) {
+  corpus_names = str_match(
+    files_bias[[n]], "bias.+-(.+)-FEMALE-MALE.*\\.csv")[,2]
+  names(files_bias[[n]]) = corpus_names
+}
+```
+
+
+```{r}
+# read data into nested list
+dfs = list()
+for (n in names(files_bias)) {
+  files_ = files_bias[[n]]
+  dfs[[n]] = list()
+  for (corpus in names(files_)) {
+    dfs[[n]][[corpus]] = read_csv(files_[corpus], show_col_types=F)
+  }
+}
+```
+
+
+```{r}
+# add frequency bins
+add_frequency_bins = function(df) {
+  log_freq = log10(df[["freq"]])
+  max_value = max(log_freq)
+  # cuts = c(seq(2, 6., 1.), max_value)
+  cuts = c(seq(2, 6., .5), max_value)
+  df = df %>% mutate(bins = cut(log_freq, cuts, include.lowest=T))
+  return(df)
+}
+
+for (n in names(dfs)) {
+  for (corpus in names(dfs[[n]])) {
+    dfs[[n]][[corpus]] = add_frequency_bins(dfs[[n]][[corpus]])
+  }
+}
+```
+
+
+```{r}
+# concatenate dataframes
+for (n in names(dfs)) {
+  dfs[[n]] = bind_rows(dfs[[n]], .id="corpus")
+}
+```
+
+
+```{r}
+# rename bias
+dfs[[pmi_name]] = dfs[[pmi_name]] %>%
+  rename(bias=dpmi)
+dfs[["sgns"]] = dfs[["sgns"]] %>%
+  rename(bias=bias_score)
+dfs[["glove"]] = dfs[["glove"]] %>%
+  rename(bias=bias_score)
+```
+
+
+```{r}
+# drop columns and aggregate shuffled wikipedia
+clean_df = function(df, corpus_name="wiki2021") {
+  df = df %>% select(corpus, idx, word, freq, bins, bias)
+  df_original = df %>% filter(corpus == corpus_name)
+  df_shuffled = df %>% filter(corpus != corpus_name)
+  df_shuffled = df_shuffled %>%
+    group_by(idx, word, bins) %>%
+    summarise(
+      bias = mean(bias),
+      freq = max(freq)
+    ) %>%
+    ungroup() %>%
+    mutate(corpus = glue("{corpus_name}_shuffled"))
+  df_final = bind_rows(df_original, df_shuffled)
+  return(df_final)
+}
+
+for (n in names(dfs)) {
+  dfs[[n]] = clean_df(dfs[[n]])
+}
+```
+
+### Explore
+
+```{r}
+# frequencies of the context words
+df_freq = read_delim(
+  "data/working/vocab-wiki2021-V100.txt", delim=" ", show_col_types=F,
+  col_names=c("Word", "Frequency"))
+female_words = readLines("words_lists/FEMALE.txt")
+male_words = readLines("words_lists/MALE.txt")
+
+tab_female = df_freq %>% filter(Word %in% c(female_words))
+cat(tab_female %>% kableExtra::kable(format="latex", booktabs=T))
+
+tab_male = df_freq %>% filter(Word %in% c(male_words))
+cat(tab_male %>% kableExtra::kable(format="latex", booktabs=T))
+```
+
+
+
+```{r}
+# words in each frequency bin
+clean_log_labels = function(labs) {
+  labs = str_replace(labs, ",", "},10^{")
+  labs = str_replace(labs, "([\\[\\(])", "\\110^{")
+  labs = str_replace(labs, "([\\]\\)])", "}\\1")
+  # labs = str_replace(labs, "(\\])", r"(\\])")
+  # labs = str_replace(labs, "^(\\[)", r"(\\[)")
+  return(labs)
+}
+
+df_ = dfs$glove %>% filter(corpus == "wiki2021") 
+clean_labels = clean_log_labels(levels(df_[["bins"]]))
+levels(df_[["bins"]]) = clean_labels
+
+tab = df_ %>% 
+  pull(bins) %>% 
+  table() %>% 
+  as_tibble() %>% 
+  setNames(c("Frequency", "# types"))
+
+cat(tab %>% kableExtra::kable(format="latex", booktabs = TRUE))
+```
+
+
+## Plots
+
+### Boxplots
+
+
+```{r}
+# boxplots
+boxplots_plt = function(df, ylab="Female bias", xlab=NULL,
+                        title=NULL, subtitle=NULL, effect_sizes=F) {
+  # bin labels
+  labs = levels(df[["bins"]])
+  labs = str_replace(labs, ",", "},10^{")
+  labs = str_replace(labs, "([\\[\\(])", "\\1$10^{")
+  labs = str_replace(labs, "([\\]\\)])", "}$\\1")
+  labs = str_replace(labs, "(\\])$", r"(\\])")
+  labs = str_replace(labs, "^(\\[)", r"(\\[)")
+  labs = lapply(sprintf(r'(%s)', labs), TeX)
+  labs = unlist(labs)
+  # plot
+  p = ggplot(df, aes(x=bins, y=bias)) +
+    gg.layers::geom_boxplot2(
+      width.errorbar=0.2, fill="lightblue", color="black") +
+    stat_summary(fun="mean", color="navy") +    
+    geom_hline(yintercept=0, color="black", linetype="dashed") +
+    labs(x=xlab, y=ylab, title=title, subtitle=subtitle) +
+    scale_x_discrete(labels=labs, guide=guide_axis(angle=35)) +
+    theme_minimal() +
+    theme(
+      axis.title.x=element_text(size=15), axis.title.y=element_text(size=16),
+      axis.text=element_text(size=14), strip.text=element_text(size=15),
+      plot.subtitle=element_text(size=16)
+      ) +
+    NULL
+  if (effect_sizes == T) {
+    df_effect_sizes = df %>%
+      group_by(bins) %>%
+      summarise(mean_bias = mean(bias), sd_bias = sd(bias)) %>%
+      mutate(ef = mean_bias / sd_bias)
+    y_limits = layer_scales(p)$y$get_limits()
+    y_adj = (y_limits[2] - y_limits[1]) * 0.07
+    y_text = y_limits[2] + y_adj
+    p = p +
+      geom_text(
+        data=df_effect_sizes,
+        aes(x=bins, label=round(ef, 2)), y=y_text, color="navy", size=5) +
+      lims(y = c(NA, y_text)) +
+      NULL
+  }
+  return(p)
+}
+```
+
+
+```{r, warning=F}
+model_names = c("pmi1"="PMI", "sgns"="SGNS", "glove"="GloVe")
+last_name = names(dfs)[length(names(dfs))]
+
+for (corpus_ in c("wiki2021", "wiki2021_shuffled")) {
+  plot_list_ = list()
+  for (n in names(dfs)) {
+    name = model_names[n]
+    x_label = NULL
+    if (n == last_name) x_label = "Frequency"
+    p_ = boxplots_plt(
+      dfs[[n]] %>% filter(corpus == corpus_), ylab=glue("Female bias ({name})"),
+      xlab=x_label, effect_sizes=T)
+    plot_list_[[n]] = p_
+    print(p_)
+  }
+  outname = glue("results/plots/boxplots_{corpus_}.png")
+  grid_ = plot_grid(plotlist=plot_list_, ncol=1)
+  save_plot(outname, grid_, base_height=10, base_width=6, dpi=300)
+}
+
+# NOTE we dont use facet_wrap because it is hard to use it with geom_text
+```
+
